@@ -443,4 +443,4 @@ elif uploaded_file is None:
     - ✅ *Export results* - Download video and CSV reports
     - ✅ *Large file support* - Up to 10GB video files
     - ✅ *Processing time tracking* - See how fast your video is processed
-    """)
+    """)
