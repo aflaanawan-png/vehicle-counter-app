@@ -45,13 +45,23 @@ if 'video_duration' not in st.session_state:
 # Sidebar configuration
 st.sidebar.header("⚙️ Configuration")
 confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.25, 0.05)
-skip_frames = st.sidebar.slider("Skip Frames (Speed)", 1, 10, 4)
+skip_frames = st.sidebar.slider("Skip Frames (Speed)", 1, 10, 2)
 line_position = st.sidebar.slider("Counting Line Position", 0.0, 1.0, 0.5, 0.05)
 
 # Parallel processing option
-st.sidebar.header("🚀 Parallel Processing")
-enable_parallel = st.sidebar.checkbox("Enable Parallel Processing (>2hr videos)", value=True,
-                                     help="Split video into 2 parts and process simultaneously")
+st.sidebar.header("🚀 Processing Mode")
+processing_mode = st.sidebar.radio(
+    "Select Processing Mode",
+    options=["Single Thread", "Parallel (2x Speed)"],
+    index=0,
+    help="Parallel mode splits video into 2 parts and processes simultaneously for ~2x speedup"
+)
+enable_parallel = (processing_mode == "Parallel (2x Speed)")
+
+if enable_parallel:
+    st.sidebar.success("⚡ Parallel mode enabled - ~2x faster!")
+else:
+    st.sidebar.info("🔄 Single thread mode - Standard processing")
 
 # FHWA Vehicle Classes
 st.sidebar.header("📊 FHWA Vehicle Classes")
@@ -223,8 +233,8 @@ def split_video(input_path, output_path1, output_path2):
             '-y', output_path2
         ]
         
-        subprocess.run(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         
         return True, duration
     except Exception as e:
@@ -296,6 +306,13 @@ def process_video_segment(video_path, confidence, skip_frames, line_position,
             cv2.putText(frame, f"Total: {total_count}", (10, 30),
                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             
+            y_offset = 65
+            for cls, count in sorted(class_counts.items()):
+                if count > 0:
+                    cv2.putText(frame, f"C{cls}: {count}", (10, y_offset),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    y_offset += 25
+            
             out.write(frame)
             
             # Update progress
@@ -336,7 +353,7 @@ def merge_videos(video1_path, video2_path, output_path):
             '-y', output_path
         ]
         
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         
         os.unlink(concat_file.name)
         return True
@@ -363,12 +380,13 @@ if uploaded_file is not None:
     video_duration_temp = total_frames_temp / fps_temp if fps_temp > 0 else 0
     cap_temp.release()
     
-    is_long_video = video_duration_temp > 7200  # 2 hours
-    
-    if is_long_video and enable_parallel:
-        st.info(f"🚀 Video is {format_time(video_duration_temp)} - Parallel processing will be used (2x faster!)")
+    # Display info based on mode
+    if enable_parallel:
+        estimated_time = video_duration_temp / (skip_frames * 2)  # Rough estimate with 2x speedup
+        st.info(f"🚀 **Parallel Mode** | Video: {format_time(video_duration_temp)} | Est. Processing: ~{format_time(estimated_time)} | Speedup: ~2x")
     else:
-        st.info(f"📊 Video duration: {format_time(video_duration_temp)}")
+        estimated_time = video_duration_temp / skip_frames  # Rough estimate
+        st.info(f"📊 **Single Thread Mode** | Video: {format_time(video_duration_temp)} | Est. Processing: ~{format_time(estimated_time)}")
     
     if st.button("▶️ Start Processing", type="primary"):
         try:
@@ -376,107 +394,125 @@ if uploaded_file is not None:
             start_time = time.time()
             
             # Check if we should use parallel processing
-            if is_long_video and enable_parallel:
+            if enable_parallel:
                 st.info("🔄 Splitting video into 2 segments for parallel processing...")
                 
                 # Split video
                 segment1_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
                 segment2_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
                 
-                success, duration = split_video(video_path, segment1_path, segment2_path)
+                with st.spinner("✂️ Splitting video..."):
+                    success, duration = split_video(video_path, segment1_path, segment2_path)
                 
                 if not success:
-                    st.error("Failed to split video. Using single-threaded processing.")
-                    raise Exception("Video splitting failed")
-                
-                st.success("✅ Video split complete! Starting parallel processing...")
-                
-                # Create shared progress dictionary
-                manager = Manager()
-                progress_dict = manager.dict()
-                progress_dict['segment_1'] = 0.0
-                progress_dict['segment_2'] = 0.0
-                
-                # Create result queue
-                result_queue = Queue()
-                
-                # Start two processes
-                with st.spinner("🔄 Loading YOLO models for both segments..."):
-                    p1 = Process(target=process_video_segment, 
-                                args=(segment1_path, confidence, skip_frames, line_position, 
-                                      1, result_queue, progress_dict))
-                    p2 = Process(target=process_video_segment, 
-                                args=(segment2_path, confidence, skip_frames, line_position, 
-                                      2, result_queue, progress_dict))
+                    st.error("Failed to split video. Falling back to single-threaded processing.")
+                    enable_parallel = False
+                else:
+                    st.success("✅ Video split complete! Starting parallel processing...")
                     
-                    p1.start()
-                    p2.start()
-                
-                # Monitor progress
-                progress_bar1 = st.progress(0)
-                progress_bar2 = st.progress(0)
-                status_text = st.empty()
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write("🎬 Segment 1 (First Half)")
-                with col2:
-                    st.write("🎬 Segment 2 (Second Half)")
-                
-                while p1.is_alive() or p2.is_alive():
-                    progress_bar1.progress(progress_dict.get('segment_1', 0))
-                    progress_bar2.progress(progress_dict.get('segment_2', 0))
+                    # Create shared progress dictionary
+                    manager = Manager()
+                    progress_dict = manager.dict()
+                    progress_dict['segment_1'] = 0.0
+                    progress_dict['segment_2'] = 0.0
                     
-                    elapsed = time.time() - start_time
-                    status_text.text(f"⏱️ Processing both segments... Elapsed: {format_time(elapsed)}")
-                    time.sleep(0.5)
-                
-                p1.join()
-                p2.join()
-                
-                progress_bar1.progress(1.0)
-                progress_bar2.progress(1.0)
-                
-                # Get results
-                results = []
-                while not result_queue.empty():
-                    results.append(result_queue.get())
-                
-                if len(results) != 2:
-                    raise Exception("Failed to process both segments")
-                
-                # Sort by segment_id
-                results.sort(key=lambda x: x['segment_id'])
-                
-                # Merge class counts
-                class_counts = defaultdict(int)
-                for result in results:
-                    if 'error' in result:
-                        raise Exception(f"Segment {result['segment_id']} error: {result['error']}")
-                    for cls, count in result['class_counts'].items():
-                        class_counts[cls] += count
-                
-                st.info("🔄 Merging processed video segments...")
-                
-                # Merge videos
-                output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
-                merge_success = merge_videos(results[0]['output_path'], 
-                                            results[1]['output_path'], 
-                                            output_path)
-                
-                if not merge_success:
-                    st.warning("⚠️ Video merge failed, using first segment only")
-                    output_path = results[0]['output_path']
-                
-                # Cleanup
-                os.unlink(segment1_path)
-                os.unlink(segment2_path)
-                if merge_success:
-                    os.unlink(results[0]['output_path'])
-                    os.unlink(results[1]['output_path'])
-                
-            else:
-                # Single-threaded processing (original code)
+                    # Create result queue
+                    result_queue = Queue()
+                    
+                    # Start two processes
+                    with st.spinner("🔄 Loading YOLO models for both segments..."):
+                        p1 = Process(target=process_video_segment, 
+                                    args=(segment1_path, confidence, skip_frames, line_position, 
+                                          1, result_queue, progress_dict))
+                        p2 = Process(target=process_video_segment, 
+                                    args=(segment2_path, confidence, skip_frames, line_position, 
+                                          2, result_queue, progress_dict))
+                        
+                        p1.start()
+                        p2.start()
+                    
+                    # Monitor progress
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write("🎬 **Segment 1** (First Half)")
+                        progress_bar1 = st.progress(0)
+                    with col2:
+                        st.write("🎬 **Segment 2** (Second Half)")
+                        progress_bar2 = st.progress(0)
+                    
+                    status_text = st.empty()
+                    time_text = st.empty()
+                    
+                    while p1.is_alive() or p2.is_alive():
+                        prog1 = progress_dict.get('segment_1', 0)
+                        prog2 = progress_dict.get('segment_2', 0)
+                        progress_bar1.progress(min(prog1, 1.0))
+                        progress_bar2.progress(min(prog2, 1.0))
+                        
+                        elapsed = time.time() - start_time
+                        avg_progress = (prog1 + prog2) / 2
+                        if avg_progress > 0.01:
+                            est_total = elapsed / avg_progress
+                            remaining = est_total - elapsed
+                            time_text.text(f"⏱️ Elapsed: {format_time(elapsed)} | Remaining: ~{format_time(remaining)}")
+                        
+                        status_text.text(f"🔄 Processing both segments... Seg1: {prog1*100:.1f}% | Seg2: {prog2*100:.1f}%")
+                        time.sleep(0.5)
+                    
+                    p1.join()
+                    p2.join()
+                    
+                    progress_bar1.progress(1.0)
+                    progress_bar2.progress(1.0)
+                    
+                    # Get results
+                    results = []
+                    while not result_queue.empty():
+                        results.append(result_queue.get())
+                    
+                    if len(results) != 2:
+                        raise Exception("Failed to process both segments")
+                    
+                    # Sort by segment_id
+                    results.sort(key=lambda x: x['segment_id'])
+                    
+                    # Check for errors
+                    for result in results:
+                        if 'error' in result:
+                            raise Exception(f"Segment {result['segment_id']} error: {result['error']}")
+                    
+                    # Merge class counts
+                    class_counts = defaultdict(int)
+                    for result in results:
+                        for cls, count in result['class_counts'].items():
+                            class_counts[cls] += count
+                    
+                    st.info("🔄 Merging processed video segments...")
+                    
+                    # Merge videos
+                    output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+                    merge_success = merge_videos(results[0]['output_path'], 
+                                                results[1]['output_path'], 
+                                                output_path)
+                    
+                    if not merge_success:
+                        st.warning("⚠️ Video merge failed, using first segment only")
+                        output_path = results[0]['output_path']
+                    
+                    # Cleanup
+                    os.unlink(segment1_path)
+                    os.unlink(segment2_path)
+                    if merge_success:
+                        try:
+                            os.unlink(results[0]['output_path'])
+                            os.unlink(results[1]['output_path'])
+                        except:
+                            pass
+                    
+                    video_duration_seconds = video_duration_temp
+            
+            # Single-threaded processing
+            if not enable_parallel:
                 with st.spinner("🔄 Loading YOLOv8 model..."):
                     model = YOLO('yolov8n.pt')
                 
@@ -587,7 +623,8 @@ if uploaded_file is not None:
             st.session_state.class_counts = dict(class_counts)
             st.session_state.total_count = total
             st.session_state.processing_time = processing_time
-            st.session_state.video_duration = video_duration_temp
+            st.session_state.video_duration = video_duration_seconds
+            st.session_state.parallel_used = enable_parallel
             
             results_data = []
             for cls in range(1, 14):
@@ -628,15 +665,17 @@ if uploaded_file is not None:
 if st.session_state.processed:
     processing_speed = (st.session_state.video_duration / st.session_state.processing_time) if st.session_state.processing_time > 0 else 0
     
+    parallel_badge = "🚀 Parallel Mode" if st.session_state.get('parallel_used', False) else "🔄 Single Thread"
+    
     st.markdown(f"""
         <div style='background-color: #e8f4f8; padding: 15px; border-radius: 10px; margin: 20px 0; border-left: 5px solid #0066cc;'>
-            <h3 style='color: #0066cc; margin: 0;'>⏱️ Processing Time</h3>
+            <h3 style='color: #0066cc; margin: 0;'>⏱️ Processing Time <span style='font-size: 0.8rem; background: #0066cc; color: white; padding: 3px 8px; border-radius: 5px; margin-left: 10px;'>{parallel_badge}</span></h3>
             <p style='font-size: 1.3rem; font-weight: bold; color: #004080; margin: 10px 0 5px 0;'>
                 {format_time(st.session_state.processing_time)}
             </p>
             <p style='color: #666; margin: 0; font-size: 0.9rem;'>
                 Video Duration: {format_time(st.session_state.video_duration)} | 
-                Processing Speed: {processing_speed:.1f}x faster than real-time
+                Processing Speed: <strong>{processing_speed:.1f}x</strong> real-time
             </p>
         </div>
     """, unsafe_allow_html=True)
@@ -695,6 +734,7 @@ if st.session_state.processed:
         st.session_state.total_count = 0
         st.session_state.processing_time = 0
         st.session_state.video_duration = 0
+        st.session_state.parallel_used = False
         st.rerun()
 
 elif uploaded_file is None:
@@ -702,24 +742,28 @@ elif uploaded_file is None:
     st.markdown("""
     ### 📋 Instructions:
     1. Upload a traffic video (MP4, AVI, MOV, MKV) - Max 10GB
-    2. Enable "Parallel Processing" in sidebar for videos >2 hours
-    3. Click "Start Processing" to analyze
-    4. Download results and CSV report
+    2. **Select Processing Mode** in sidebar:
+       - **Single Thread**: Standard processing
+       - **Parallel (2x Speed)**: Split video and process simultaneously
+    3. Adjust detection confidence and counting line position
+    4. Click "Start Processing" to analyze
+    5. Download results and CSV report
     
-    ### 🚀 **Parallel Processing Features:**
-    - ✅ **Auto-split** - Videos >2 hours split into 2 segments
-    - ✅ **Simultaneous processing** - Both segments processed at same time
-    - ✅ **~2x speedup** - On multi-core CPUs
+    ### 🚀 **Parallel Processing Mode:**
+    - ✅ **Works with ANY video length** - You choose the mode!
+    - ✅ **~2x faster** - Processes two halves simultaneously
     - ✅ **Single output** - Merged video + combined CSV
-    - ✅ **Progress tracking** - See both segments in real-time
+    - ✅ **Real-time progress** - See both segments processing
+    - ✅ **Automatic fallback** - Falls back to single thread if splitting fails
     
     ### 📊 **Performance Comparison:**
     
-    | Video Length | Normal | Parallel | Time Saved |
-    |--------------|--------|----------|------------|
+    | Video Length | Single Thread | Parallel Mode | Time Saved |
+    |--------------|---------------|---------------|------------|
+    | 1 hour | 30 min | 15 min | 15 min |
     | 2 hours | 1 hour | 30 min | 30 min |
     | 4 hours | 2 hours | 1 hour | 1 hour |
-    | 8 hours | 4 hours | 2 hours | 2 hours |
+    | 8 hours | 4 hours | 2 hours | **2 hours** 🚀 |
     
     ### 🎯 **Features:**
     - ✅ No double counting
@@ -727,4 +771,9 @@ elif uploaded_file is None:
     - ✅ Real-time progress tracking
     - ✅ CSV export with combined counts
     - ✅ Merged video output
+    - ✅ User-selectable processing mode
+    
+    ### ⚙️ **Requirements for Parallel Mode:**
+    - `ffmpeg` must be installed on your system
+    - Multi-core CPU recommended for best performance
     """)
