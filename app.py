@@ -41,7 +41,7 @@ if 'video_duration' not in st.session_state:
     st.session_state.video_duration = 0
 
 # Sidebar configuration
-st.sidebar.header("⚙ Configuration")
+st.sidebar.header("⚙️ Configuration")
 confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.25, 0.05)
 skip_frames = st.sidebar.slider("Skip Frames (Speed)", 1, 10, 2)
 line_position = st.sidebar.slider("Counting Line Position", 0.0, 1.0, 0.5, 0.05)
@@ -98,7 +98,7 @@ def map_to_fhwa(yolo_class, bbox_area):
 
 # Vehicle tracker
 class VehicleTracker:
-    def _init_(self, max_disappeared=30, max_distance=100):
+    def __init__(self, max_disappeared=30, max_distance=100):
         self.next_object_id = 0
         self.objects = {}
         self.disappeared = {}
@@ -197,7 +197,7 @@ if uploaded_file is not None:
     
     st.video(video_path)
     
-    if st.button("▶ Start Processing", type="primary"):
+    if st.button("▶️ Start Processing", type="primary"):
         try:
             st.session_state.processed = False
             
@@ -292,7 +292,7 @@ if uploaded_file is not None:
                 if progress > 0:
                     estimated_total = elapsed_time / progress
                     remaining_time = estimated_total - elapsed_time
-                    time_text.text(f"⏱ Elapsed: {format_time(elapsed_time)} | Estimated remaining: {format_time(remaining_time)}")
+                    time_text.text(f"⏱️ Elapsed: {format_time(elapsed_time)} | Estimated remaining: {format_time(remaining_time)}")
                 
                 status_text.text(f"Processing: {frame_count}/{total_frames} frames | Detected: {total_count} vehicles")
                 
@@ -358,7 +358,7 @@ if st.session_state.processed:
     
     st.markdown(f"""
         <div style='background-color: #e8f4f8; padding: 15px; border-radius: 10px; margin: 20px 0; border-left: 5px solid #0066cc;'>
-            <h3 style='color: #0066cc; margin: 0;'>⏱ Processing Time</h3>
+            <h3 style='color: #0066cc; margin: 0;'>⏱️ Processing Time</h3>
             <p style='font-size: 1.3rem; font-weight: bold; color: #004080; margin: 10px 0 5px 0;'>
                 {format_time(st.session_state.processing_time)}
             </p>
@@ -369,7 +369,7 @@ if st.session_state.processed:
         </div>
     """, unsafe_allow_html=True)
     
-    st.subheader("⬇ Download Results")
+    st.subheader("⬇️ Download Results")
     
     col1, col2 = st.columns(2)
     
@@ -437,10 +437,10 @@ elif uploaded_file is None:
     4. Download results and CSV report
     
     ### 🎯 Features:
-    - ✅ *No double counting* - Advanced tracking prevents re-counting
-    - ✅ *FHWA classification* - Automatic vehicle type detection
-    - ✅ *Real-time progress* - See detection as it processes
-    - ✅ *Export results* - Download video and CSV reports
-    - ✅ *Large file support* - Up to 10GB video files
-    - ✅ *Processing time tracking* - See how fast your video is processed
-    """)
+    - ✅ **No double counting** - Advanced tracking prevents re-counting
+    - ✅ **FHWA classification** - Automatic vehicle type detection
+    - ✅ **Real-time progress** - See detection as it processes
+    - ✅ **Export results** - Download video and CSV reports
+    - ✅ **Large file support** - Up to 10GB video files
+    - ✅ **Processing time tracking** - See how fast your video is processed
+    """)
