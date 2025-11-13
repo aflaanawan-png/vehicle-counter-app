@@ -7,8 +7,6 @@ import pandas as pd
 from datetime import datetime
 import tempfile
 import os
-import time
-import torch
 
 # Page configuration
 st.set_page_config(page_title="Vehicle Counter", layout="wide")
@@ -36,46 +34,12 @@ if 'class_counts' not in st.session_state:
     st.session_state.class_counts = None
 if 'total_count' not in st.session_state:
     st.session_state.total_count = 0
-if 'processing_time' not in st.session_state:
-    st.session_state.processing_time = 0
-if 'video_duration' not in st.session_state:
-    st.session_state.video_duration = 0
 
 # Sidebar configuration
-st.sidebar.header("⚙️ Configuration")
-confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.3, 0.05)
-skip_frames = st.sidebar.slider("Skip Frames (Speed)", 1, 20, 5, 1,
-                                help="Higher = faster but may miss some vehicles")
+st.sidebar.header("⚙ Configuration")
+confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.25, 0.05)
+skip_frames = st.sidebar.slider("Skip Frames (Speed)", 1, 10, 2)
 line_position = st.sidebar.slider("Counting Line Position", 0.0, 1.0, 0.5, 0.05)
-
-# Check if GPU is available
-gpu_available = torch.cuda.is_available()
-
-# Advanced settings
-with st.sidebar.expander("🚀 Advanced Speed Settings"):
-    if gpu_available:
-        use_gpu = st.checkbox("Use GPU Acceleration", value=True)
-        use_half_precision = st.checkbox("Use Half Precision (FP16)", value=True)
-    else:
-        st.warning("⚠️ No GPU detected - using AGGRESSIVE CPU optimizations")
-        use_gpu = False
-        use_half_precision = False
-    
-    # Aggressive CPU optimizations
-    img_size = st.selectbox("Detection Image Size", 
-                           options=[320, 416, 640], 
-                           index=0,
-                           help="Smaller = faster. 320 is 4x faster than 640!")
-    
-    reduce_output_quality = st.checkbox("Reduce Output Video Quality", value=True,
-                                       help="Faster video encoding (smaller file)")
-    
-    update_display_every = st.slider("Update Display Every N Frames", 
-                                    10, 100, 50, 10,
-                                    help="Less frequent updates = faster processing")
-    
-    max_det = st.slider("Max Detections Per Frame", 10, 100, 30, 10,
-                       help="Fewer detections = faster processing")
 
 # FHWA Vehicle Classes
 st.sidebar.header("📊 FHWA Vehicle Classes")
@@ -98,18 +62,6 @@ fhwa_classes = {
 for cls, name in fhwa_classes.items():
     st.sidebar.text(f"Class {cls}: {name}")
 
-# Helper function to format time
-def format_time(seconds):
-    if seconds < 60:
-        return f"{seconds:.1f} seconds"
-    elif seconds < 3600:
-        minutes = seconds / 60
-        return f"{minutes:.1f} minutes"
-    else:
-        hours = seconds / 3600
-        minutes = (seconds % 3600) / 60
-        return f"{hours:.1f} hours {minutes:.0f} min"
-
 # YOLO to FHWA mapping
 def map_to_fhwa(yolo_class, bbox_area):
     """Map YOLO class to FHWA vehicle class"""
@@ -131,102 +83,92 @@ def map_to_fhwa(yolo_class, bbox_area):
             return 9  # Large truck
     return 2  # Default to passenger car
 
-# Simplified fast tracker
-class FastVehicleTracker:
-    def __init__(self, max_distance=150):
-        self.next_id = 0
-        self.tracks = {}
+# Vehicle tracker
+class VehicleTracker:
+    def _init_(self, max_disappeared=30, max_distance=100):
+        self.next_object_id = 0
+        self.objects = {}
+        self.disappeared = {}
         self.counted = set()
+        self.max_disappeared = max_disappeared
         self.max_distance = max_distance
+        
+    def register(self, centroid, fhwa_class):
+        self.objects[self.next_object_id] = {
+            'centroid': centroid,
+            'class': fhwa_class,
+            'crossed': False
+        }
+        self.disappeared[self.next_object_id] = 0
+        self.next_object_id += 1
+        
+    def deregister(self, object_id):
+        del self.objects[object_id]
+        del self.disappeared[object_id]
         
     def update(self, detections, line_y):
         newly_counted = []
         
         if len(detections) == 0:
-            # Remove old tracks
-            to_remove = [tid for tid, track in self.tracks.items() 
-                        if track['frames_missing'] > 10]
-            for tid in to_remove:
-                del self.tracks[tid]
-            
-            # Increment missing frames
-            for track in self.tracks.values():
-                track['frames_missing'] += 1
-            
+            for object_id in list(self.disappeared.keys()):
+                self.disappeared[object_id] += 1
+                if self.disappeared[object_id] > self.max_disappeared:
+                    self.deregister(object_id)
             return newly_counted
         
-        current_centroids = np.array([d[0] for d in detections])
-        current_classes = [d[1] for d in detections]
+        input_centroids = np.array([d[0] for d in detections])
+        input_classes = [d[1] for d in detections]
         
-        if len(self.tracks) == 0:
-            # Register all new tracks
-            for centroid, cls in detections:
-                self.tracks[self.next_id] = {
-                    'centroid': centroid,
-                    'class': cls,
-                    'frames_missing': 0
-                }
-                self.next_id += 1
-            return newly_counted
-        
-        # Fast matching using Manhattan distance
-        track_ids = list(self.tracks.keys())
-        track_centroids = np.array([self.tracks[tid]['centroid'] for tid in track_ids])
-        
-        # Manhattan distance (faster than Euclidean)
-        distances = np.abs(track_centroids[:, np.newaxis, 0] - current_centroids[:, 0]) + \
-                   np.abs(track_centroids[:, np.newaxis, 1] - current_centroids[:, 1])
-        
-        # Greedy matching
-        matched_tracks = set()
-        matched_detections = set()
-        
-        for _ in range(min(len(track_ids), len(detections))):
-            min_dist = distances.min()
-            if min_dist > self.max_distance:
-                break
+        if len(self.objects) == 0:
+            for i, (centroid, fhwa_class) in enumerate(detections):
+                self.register(centroid, fhwa_class)
+        else:
+            object_ids = list(self.objects.keys())
+            object_centroids = np.array([self.objects[oid]['centroid'] for oid in object_ids])
             
-            track_idx, det_idx = np.unravel_index(distances.argmin(), distances.shape)
+            D = np.linalg.norm(object_centroids[:, np.newaxis] - input_centroids, axis=2)
             
-            track_id = track_ids[track_idx]
-            old_y = self.tracks[track_id]['centroid'][1]
-            new_centroid = current_centroids[det_idx]
-            new_y = new_centroid[1]
+            rows = D.min(axis=1).argsort()
+            cols = D.argmin(axis=1)[rows]
             
-            # Update track
-            self.tracks[track_id]['centroid'] = new_centroid
-            self.tracks[track_id]['frames_missing'] = 0
+            used_rows = set()
+            used_cols = set()
             
-            # Check if crossed line
-            if track_id not in self.counted and old_y < line_y <= new_y:
-                self.counted.add(track_id)
-                newly_counted.append(self.tracks[track_id]['class'])
+            for (row, col) in zip(rows, cols):
+                if row in used_rows or col in used_cols:
+                    continue
+                    
+                if D[row, col] > self.max_distance:
+                    continue
+                    
+                object_id = object_ids[row]
+                old_centroid = self.objects[object_id]['centroid']
+                new_centroid = input_centroids[col]
+                
+                self.objects[object_id]['centroid'] = new_centroid
+                self.disappeared[object_id] = 0
+                
+                if (object_id not in self.counted and 
+                    not self.objects[object_id]['crossed'] and
+                    old_centroid[1] < line_y <= new_centroid[1]):
+                    
+                    self.objects[object_id]['crossed'] = True
+                    self.counted.add(object_id)
+                    newly_counted.append(self.objects[object_id]['class'])
+                
+                used_rows.add(row)
+                used_cols.add(col)
             
-            matched_tracks.add(track_idx)
-            matched_detections.add(det_idx)
+            unused_rows = set(range(D.shape[0])) - used_rows
+            for row in unused_rows:
+                object_id = object_ids[row]
+                self.disappeared[object_id] += 1
+                if self.disappeared[object_id] > self.max_disappeared:
+                    self.deregister(object_id)
             
-            # Set to infinity to avoid re-matching
-            distances[track_idx, :] = np.inf
-            distances[:, det_idx] = np.inf
-        
-        # Register unmatched detections
-        for det_idx in range(len(detections)):
-            if det_idx not in matched_detections:
-                self.tracks[self.next_id] = {
-                    'centroid': current_centroids[det_idx],
-                    'class': current_classes[det_idx],
-                    'frames_missing': 0
-                }
-                self.next_id += 1
-        
-        # Remove old unmatched tracks
-        to_remove = [track_ids[i] for i in range(len(track_ids)) 
-                    if i not in matched_tracks]
-        for tid in to_remove:
-            if self.tracks[tid]['frames_missing'] > 10:
-                del self.tracks[tid]
-            else:
-                self.tracks[tid]['frames_missing'] += 1
+            unused_cols = set(range(D.shape[1])) - used_cols
+            for col in unused_cols:
+                self.register(input_centroids[col], input_classes[col])
         
         return newly_counted
 
@@ -242,87 +184,33 @@ if uploaded_file is not None:
     
     st.video(video_path)
     
-    # Display estimated processing time
-    cap_temp = cv2.VideoCapture(video_path)
-    total_frames_temp = int(cap_temp.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps_temp = int(cap_temp.get(cv2.CAP_PROP_FPS))
-    video_duration_temp = total_frames_temp / fps_temp if fps_temp > 0 else 0
-    cap_temp.release()
-    
-    # Estimate processing time based on settings
-    # Base: 1 frame = 0.1 seconds on CPU with 640px
-    base_time_per_frame = 0.1
-    
-    # Image size factor
-    size_factor = (img_size / 640) ** 2  # 320 = 0.25x time
-    
-    # GPU speedup
-    if use_gpu and use_half_precision:
-        gpu_factor = 0.1
-    elif use_gpu:
-        gpu_factor = 0.2
-    else:
-        gpu_factor = 1.0
-    
-    frames_to_process = total_frames_temp / skip_frames
-    estimated_time = frames_to_process * base_time_per_frame * size_factor * gpu_factor
-    
-    speedup = video_duration_temp / estimated_time if estimated_time > 0 else 0
-    
-    st.info(f"📊 Video: {format_time(video_duration_temp)} | Est. Processing: ~{format_time(estimated_time)} | Speedup: {speedup:.1f}x")
-    
-    if st.button("▶️ Start Processing", type="primary"):
+    if st.button("▶ Start Processing", type="primary"):
         try:
             st.session_state.processed = False
             
-            # Start timing
-            start_time = time.time()
-            
-            with st.spinner("🔄 Loading optimized YOLOv8n model..."):
+            with st.spinner("🔄 Loading YOLOv8 model..."):
                 model = YOLO('yolov8n.pt')
-                device = 'cuda:0' if use_gpu else 'cpu'
-                
-                if use_gpu and use_half_precision:
-                    model.model.half()
-                    st.success("✅ GPU + FP16 enabled!")
-                elif use_gpu:
-                    st.success("✅ GPU enabled!")
-                else:
-                    st.info(f"ℹ️ CPU mode - Using {img_size}px detection (4x faster than 640px!)")
             
             cap = cv2.VideoCapture(video_path)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = int(cap.get(cv2.CAP_PROP_FPS))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            video_duration_seconds = total_frames / fps if fps > 0 else 0
-            
             line_y = int(height * line_position)
-            tracker = FastVehicleTracker(max_distance=150)
+            tracker = VehicleTracker(max_disappeared=fps, max_distance=150)
             class_counts = defaultdict(int)
             
             progress_bar = st.progress(0)
             status_text = st.empty()
-            time_text = st.empty()
             frame_placeholder = st.empty()
             
             frame_count = 0
             processed_frames = 0
             
             output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
-            
-            # Use faster codec
-            if reduce_output_quality:
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Faster encoding
-            else:
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(output_path, fourcc, fps//skip_frames, (width, height))
-            
-            last_display_update = 0
             
             while cap.isOpened():
                 ret, frame = cap.read()
@@ -336,85 +224,56 @@ if uploaded_file is not None:
                 
                 processed_frames += 1
                 
-                # Run inference with aggressive optimizations
-                results = model.predict(
-                    frame, 
-                    conf=confidence, 
-                    verbose=False,
-                    device=device,
-                    half=use_half_precision if use_gpu else False,
-                    imgsz=img_size,  # CRITICAL: Smaller image = much faster
-                    max_det=max_det,  # Limit detections
-                    agnostic_nms=True,  # Faster NMS
-                    classes=[2, 3, 5, 7]  # Only detect vehicles
-                )
+                results = model(frame, conf=confidence, verbose=False)
                 
                 detections = []
                 for r in results:
                     boxes = r.boxes
                     for box in boxes:
                         cls = int(box.cls[0])
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
-                        bbox_area = (x2 - x1) * (y2 - y1)
-                        fhwa_class = map_to_fhwa(cls, bbox_area)
-                        detections.append((centroid, fhwa_class))
-                        
-                        # Draw on frame
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                        cv2.circle(frame, (int(centroid[0]), int(centroid[1])), 4, (0, 0, 255), -1)
-                        cv2.putText(frame, f"C{fhwa_class}", (int(x1), int(y1)-5),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                        if cls in [2, 3, 5, 7]:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
+                            bbox_area = (x2 - x1) * (y2 - y1)
+                            fhwa_class = map_to_fhwa(cls, bbox_area)
+                            detections.append((centroid, fhwa_class))
+                            
+                            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                            cv2.circle(frame, (int(centroid[0]), int(centroid[1])), 4, (0, 0, 255), -1)
+                            cv2.putText(frame, f"Class {fhwa_class}", (int(x1), int(y1)-10),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
                 newly_counted = tracker.update(detections, line_y)
                 for fhwa_class in newly_counted:
                     class_counts[fhwa_class] += 1
                 
-                # Draw counting line
                 cv2.line(frame, (0, line_y), (width, line_y), (0, 0, 255), 3)
                 cv2.putText(frame, "COUNTING LINE", (10, line_y - 10),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 
-                # Draw counts
+                y_offset = 30
                 total_count = sum(class_counts.values())
-                cv2.putText(frame, f"Total: {total_count}", (10, 30),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(frame, f"Total: {total_count}", (10, y_offset),
+                          cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
                 
-                y_offset = 60
-                for cls in sorted(class_counts.keys()):
-                    if class_counts[cls] > 0:
-                        cv2.putText(frame, f"C{cls}: {class_counts[cls]}", (10, y_offset),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                        y_offset += 25
+                for cls, count in sorted(class_counts.items()):
+                    if count > 0:
+                        y_offset += 35
+                        cv2.putText(frame, f"Class {cls}: {count}", (10, y_offset),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
                 out.write(frame)
                 
-                # Update progress
                 progress = frame_count / total_frames
                 progress_bar.progress(progress)
+                status_text.text(f"Processing: {frame_count}/{total_frames} frames | Detected: {total_count} vehicles")
                 
-                # Calculate time estimates
-                elapsed_time = time.time() - start_time
-                if progress > 0.01:
-                    estimated_total = elapsed_time / progress
-                    remaining_time = estimated_total - elapsed_time
-                    current_speed = (frame_count / fps) / elapsed_time if elapsed_time > 0 else 0
-                    time_text.text(f"⏱️ Elapsed: {format_time(elapsed_time)} | Remaining: {format_time(remaining_time)} | Speed: {current_speed:.1f}x")
-                
-                status_text.text(f"Frame: {frame_count}/{total_frames} | Vehicles: {total_count}")
-                
-                # Update display less frequently for speed
-                if processed_frames - last_display_update >= update_display_every:
+                if processed_frames % 30 == 0:
                     frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
                                           channels="RGB", use_container_width=True)
-                    last_display_update = processed_frames
             
             cap.release()
             out.release()
-            
-            # End timing
-            end_time = time.time()
-            processing_time = end_time - start_time
             
             total = sum(class_counts.values())
             
@@ -423,8 +282,6 @@ if uploaded_file is not None:
             st.session_state.output_video_path = output_path
             st.session_state.class_counts = dict(class_counts)
             st.session_state.total_count = total
-            st.session_state.processing_time = processing_time
-            st.session_state.video_duration = video_duration_seconds
             
             results_data = []
             for cls in range(1, 14):
@@ -450,8 +307,7 @@ if uploaded_file is not None:
             st.session_state.csv_filename = f"vehicle_counts_{timestamp}.csv"
             st.session_state.video_filename = f"processed_{uploaded_file.name}"
             
-            st.success(f"✅ Processing Complete! Total vehicles: {total}")
-            st.balloons()
+            st.success(f"✅ Processing Complete! Total vehicles counted: {total}")
             st.rerun()
             
         except Exception as e:
@@ -463,22 +319,7 @@ if uploaded_file is not None:
 
 # Display results if processed (PERSISTENT)
 if st.session_state.processed:
-    processing_speed = (st.session_state.video_duration / st.session_state.processing_time) if st.session_state.processing_time > 0 else 0
-    
-    st.markdown(f"""
-        <div style='background-color: #e8f4f8; padding: 15px; border-radius: 10px; margin: 20px 0; border-left: 5px solid #0066cc;'>
-            <h3 style='color: #0066cc; margin: 0;'>⏱️ Processing Time</h3>
-            <p style='font-size: 1.3rem; font-weight: bold; color: #004080; margin: 10px 0 5px 0;'>
-                {format_time(st.session_state.processing_time)}
-            </p>
-            <p style='color: #666; margin: 0; font-size: 0.9rem;'>
-                Video Duration: {format_time(st.session_state.video_duration)} | 
-                Processing Speed: <strong>{processing_speed:.1f}x</strong> real-time
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    st.subheader("⬇️ Download Results")
+    st.subheader("⬇ Download Results")
     
     col1, col2 = st.columns(2)
     
@@ -520,6 +361,8 @@ if st.session_state.processed:
     csv_preview_df = pd.read_csv(pd.io.common.StringIO(st.session_state.csv_data))
     st.dataframe(csv_preview_df)
     
+    st.info(f"🔍 Debug: class_counts dictionary = {st.session_state.class_counts}")
+    
     if st.button("🔄 Process Another Video"):
         if st.session_state.output_video_path and os.path.exists(st.session_state.output_video_path):
             os.unlink(st.session_state.output_video_path)
@@ -530,8 +373,6 @@ if st.session_state.processed:
         st.session_state.results_df = None
         st.session_state.class_counts = None
         st.session_state.total_count = 0
-        st.session_state.processing_time = 0
-        st.session_state.video_duration = 0
         st.rerun()
 
 elif uploaded_file is None:
@@ -539,30 +380,14 @@ elif uploaded_file is None:
     st.markdown("""
     ### 📋 Instructions:
     1. Upload a traffic video (MP4, AVI, MOV, MKV) - Max 10GB
-    2. **IMPORTANT FOR SPEED**: Set "Detection Image Size" to **320** (4x faster!)
-    3. Increase "Skip Frames" to 5-10 for long videos
-    4. Click "Start Processing"
+    2. Adjust detection confidence and counting line position
+    3. Click "Start Processing" to analyze
+    4. Download results and CSV report
     
-    ### 🚀 **AGGRESSIVE Speed Optimizations:**
-    
-    | Setting | Speed Gain | Recommended for 8hr video |
-    |---------|------------|---------------------------|
-    | **Image Size = 320** | **4x faster** | ✅ YES |
-    | **Skip Frames = 10** | **10x faster** | ✅ YES |
-    | **Max Detections = 30** | **1.5x faster** | ✅ YES |
-    | **Combined** | **60x faster!** | 🚀 |
-    
-    ### 📊 **Expected Performance:**
-    - **8-hour video** with recommended settings: **~8-12 minutes** processing! 🚀
-    - **320px detection**: Same accuracy for vehicle counting, 4x faster
-    - **Skip 10 frames**: Still catches all vehicles crossing the line
-    
-    ### ⚡ **Why This Is Fast:**
-    1. **320px detection** - YOLO runs 4x faster on smaller images
-    2. **Class filtering** - Only detects vehicles (not people, animals, etc.)
-    3. **Agnostic NMS** - Faster non-maximum suppression
-    4. **Optimized tracking** - Manhattan distance (faster than Euclidean)
-    5. **Reduced display updates** - Less UI overhead
-    
-    **🎯 For your 8-hour video: Use 320px + Skip 10 frames = 60x speedup!**
+    ### 🎯 Features:
+    - ✅ *No double counting* - Advanced tracking prevents re-counting
+    - ✅ *FHWA classification* - Automatic vehicle type detection
+    - ✅ *Real-time progress* - See detection as it processes
+    - ✅ *Export results* - Download video and CSV reports
+    - ✅ *Large file support* - Up to 10GB video files
     """)
