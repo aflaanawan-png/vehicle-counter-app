@@ -37,6 +37,8 @@ if 'total_count' not in st.session_state:
     st.session_state.total_count = 0
 if 'processing_time' not in st.session_state:
     st.session_state.processing_time = 0
+if 'video_duration' not in st.session_state:
+    st.session_state.video_duration = 0
 
 # Sidebar configuration
 st.sidebar.header("⚙️ Configuration")
@@ -352,6 +354,8 @@ if uploaded_file is not None:
 # Display results if processed (PERSISTENT)
 if st.session_state.processed:
     # Display processing time prominently
+    processing_speed = (st.session_state.video_duration / st.session_state.processing_time) if st.session_state.processing_time > 0 else 0
+    
     st.markdown(f"""
         <div style='background-color: #e8f4f8; padding: 15px; border-radius: 10px; margin: 20px 0; border-left: 5px solid #0066cc;'>
             <h3 style='color: #0066cc; margin: 0;'>⏱️ Processing Time</h3>
@@ -360,7 +364,7 @@ if st.session_state.processed:
             </p>
             <p style='color: #666; margin: 0; font-size: 0.9rem;'>
                 Video Duration: {format_time(st.session_state.video_duration)} | 
-                Processing Speed: {(st.session_state.video_duration / st.session_state.processing_time):.1f}x faster than real-time
+                Processing Speed: {processing_speed:.1f}x faster than real-time
             </p>
         </div>
     """, unsafe_allow_html=True)
@@ -420,6 +424,7 @@ if st.session_state.processed:
         st.session_state.class_counts = None
         st.session_state.total_count = 0
         st.session_state.processing_time = 0
+        st.session_state.video_duration = 0
         st.rerun()
 
 elif uploaded_file is None:
