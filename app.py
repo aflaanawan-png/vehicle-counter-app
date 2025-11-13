@@ -10,7 +10,30 @@ import os
 
 # Page configuration
 st.set_page_config(page_title="Vehicle Counter", layout="wide")
-st.title("🚗 FHWA Vehicle Counter with YOLOv8")
+
+# Title with link to Fiverr
+st.markdown("""
+    <h1 style='text-align: center;'>
+        🚗 FHWA Vehicle Counter by 
+        <a href='https://fiverr.com/naseem733' target='_blank' style='color: #1DBF73; text-decoration: none;'>
+            Naseem Awan
+        </a>
+    </h1>
+""", unsafe_allow_html=True)
+
+# Initialize session state for persistence
+if 'processed' not in st.session_state:
+    st.session_state.processed = False
+if 'output_video_path' not in st.session_state:
+    st.session_state.output_video_path = None
+if 'csv_data' not in st.session_state:
+    st.session_state.csv_data = None
+if 'results_df' not in st.session_state:
+    st.session_state.results_df = None
+if 'class_counts' not in st.session_state:
+    st.session_state.class_counts = None
+if 'total_count' not in st.session_state:
+    st.session_state.total_count = 0
 
 # Sidebar configuration
 st.sidebar.header("⚙️ Configuration")
@@ -39,10 +62,9 @@ fhwa_classes = {
 for cls, name in fhwa_classes.items():
     st.sidebar.text(f"Class {cls}: {name}")
 
-# YOLO to FHWA mapping (simplified based on COCO classes)
+# YOLO to FHWA mapping
 def map_to_fhwa(yolo_class, bbox_area):
     """Map YOLO class to FHWA vehicle class"""
-    # COCO classes: 2=car, 3=motorcycle, 5=bus, 7=truck
     if yolo_class == 3:  # motorcycle
         return 1
     elif yolo_class == 2:  # car
@@ -61,7 +83,7 @@ def map_to_fhwa(yolo_class, bbox_area):
             return 9  # Large truck
     return 2  # Default to passenger car
 
-# Vehicle tracker with improved logic
+# Vehicle tracker
 class VehicleTracker:
     def __init__(self, max_disappeared=30, max_distance=100):
         self.next_object_id = 0
@@ -85,10 +107,6 @@ class VehicleTracker:
         del self.disappeared[object_id]
         
     def update(self, detections, line_y):
-        """
-        detections: list of (centroid, fhwa_class) tuples
-        line_y: y-coordinate of counting line
-        """
         newly_counted = []
         
         if len(detections) == 0:
@@ -108,10 +126,8 @@ class VehicleTracker:
             object_ids = list(self.objects.keys())
             object_centroids = np.array([self.objects[oid]['centroid'] for oid in object_ids])
             
-            # Calculate distances
             D = np.linalg.norm(object_centroids[:, np.newaxis] - input_centroids, axis=2)
             
-            # Match existing objects to new detections
             rows = D.min(axis=1).argsort()
             cols = D.argmin(axis=1)[rows]
             
@@ -129,11 +145,9 @@ class VehicleTracker:
                 old_centroid = self.objects[object_id]['centroid']
                 new_centroid = input_centroids[col]
                 
-                # Update object
                 self.objects[object_id]['centroid'] = new_centroid
                 self.disappeared[object_id] = 0
                 
-                # Check if crossed line (only count downward crossing)
                 if (object_id not in self.counted and 
                     not self.objects[object_id]['crossed'] and
                     old_centroid[1] < line_y <= new_centroid[1]):
@@ -145,7 +159,6 @@ class VehicleTracker:
                 used_rows.add(row)
                 used_cols.add(col)
             
-            # Handle disappeared objects
             unused_rows = set(range(D.shape[0])) - used_rows
             for row in unused_rows:
                 object_id = object_ids[row]
@@ -153,46 +166,41 @@ class VehicleTracker:
                 if self.disappeared[object_id] > self.max_disappeared:
                     self.deregister(object_id)
             
-            # Register new objects
             unused_cols = set(range(D.shape[1])) - used_cols
             for col in unused_cols:
                 self.register(input_centroids[col], input_classes[col])
         
         return newly_counted
 
-# File uploader
-uploaded_file = st.file_uploader("📁 Upload Video File", type=['mp4', 'avi', 'mov', 'mkv'])
+# File uploader with 10GB limit
+uploaded_file = st.file_uploader("📁 Upload Video File (Max 10GB)", 
+                                  type=['mp4', 'avi', 'mov', 'mkv'],
+                                  accept_multiple_files=False)
 
 if uploaded_file is not None:
-    # Save uploaded file temporarily
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     tfile.write(uploaded_file.read())
     video_path = tfile.name
     
-    # Display video
     st.video(video_path)
     
     if st.button("▶️ Start Processing", type="primary"):
         try:
-            # Load YOLO model
-            with st.spinner("🔄 Loading YOLOv8 model..."):
-                model = YOLO('yolov8n.pt')  # Using nano model for speed
+            st.session_state.processed = False
             
-            # Open video
+            with st.spinner("🔄 Loading YOLOv8 model..."):
+                model = YOLO('yolov8n.pt')
+            
             cap = cv2.VideoCapture(video_path)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = int(cap.get(cv2.CAP_PROP_FPS))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            # Calculate line position
             line_y = int(height * line_position)
-            
-            # Initialize tracker and counters
             tracker = VehicleTracker(max_disappeared=fps, max_distance=150)
-            class_counts = defaultdict(int)  # THIS WILL STORE THE COUNTS
+            class_counts = defaultdict(int)
             
-            # Progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
             frame_placeholder = st.empty()
@@ -200,7 +208,6 @@ if uploaded_file is not None:
             frame_count = 0
             processed_frames = 0
             
-            # Create output video
             output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(output_path, fourcc, fps//skip_frames, (width, height))
@@ -212,22 +219,18 @@ if uploaded_file is not None:
                 
                 frame_count += 1
                 
-                # Skip frames for speed
                 if frame_count % skip_frames != 0:
                     continue
                 
                 processed_frames += 1
                 
-                # Run YOLO detection with lower confidence
                 results = model(frame, conf=confidence, verbose=False)
                 
-                # Extract detections
                 detections = []
                 for r in results:
                     boxes = r.boxes
                     for box in boxes:
                         cls = int(box.cls[0])
-                        # Only detect vehicles: car(2), motorcycle(3), bus(5), truck(7)
                         if cls in [2, 3, 5, 7]:
                             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                             centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
@@ -235,44 +238,36 @@ if uploaded_file is not None:
                             fhwa_class = map_to_fhwa(cls, bbox_area)
                             detections.append((centroid, fhwa_class))
                             
-                            # Draw bounding box
                             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
                             cv2.circle(frame, (int(centroid[0]), int(centroid[1])), 4, (0, 0, 255), -1)
                             cv2.putText(frame, f"Class {fhwa_class}", (int(x1), int(y1)-10),
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
-                # Update tracker and COUNT VEHICLES
                 newly_counted = tracker.update(detections, line_y)
                 for fhwa_class in newly_counted:
-                    class_counts[fhwa_class] += 1  # INCREMENT THE COUNT HERE
+                    class_counts[fhwa_class] += 1
                 
-                # Draw counting line
                 cv2.line(frame, (0, line_y), (width, line_y), (0, 0, 255), 3)
                 cv2.putText(frame, "COUNTING LINE", (10, line_y - 10),
                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 
-                # Draw counts on frame
                 y_offset = 30
                 total_count = sum(class_counts.values())
                 cv2.putText(frame, f"Total: {total_count}", (10, y_offset),
                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
                 
-                # Show individual class counts on frame
                 for cls, count in sorted(class_counts.items()):
                     if count > 0:
                         y_offset += 35
                         cv2.putText(frame, f"Class {cls}: {count}", (10, y_offset),
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
-                # Write frame
                 out.write(frame)
                 
-                # Update progress
                 progress = frame_count / total_frames
                 progress_bar.progress(progress)
                 status_text.text(f"Processing: {frame_count}/{total_frames} frames | Detected: {total_count} vehicles")
                 
-                # Show frame every 30 processed frames
                 if processed_frames % 30 == 0:
                     frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
                                           channels="RGB", use_container_width=True)
@@ -280,93 +275,111 @@ if uploaded_file is not None:
             cap.release()
             out.release()
             
-            # ✅ FIXED: Calculate total AFTER processing loop
             total = sum(class_counts.values())
             
-            # Show final results
-            st.success(f"✅ Processing Complete! Total vehicles counted: {total}")
+            # Store in session state
+            st.session_state.processed = True
+            st.session_state.output_video_path = output_path
+            st.session_state.class_counts = dict(class_counts)
+            st.session_state.total_count = total
             
-            # Display results
-            col1, col2 = st.columns(2)
+            results_data = []
+            for cls in range(1, 14):
+                count = class_counts.get(cls, 0)
+                results_data.append({
+                    'FHWA Class': cls,
+                    'Vehicle Type': fhwa_classes[cls],
+                    'Count': count,
+                    'Percentage': f"{(count/total*100):.1f}%" if total > 0 else "0%"
+                })
             
-            with col1:
-                st.subheader("📊 Vehicle Count Summary")
-                st.metric("Total Vehicles", total)
-                
-                # Create DataFrame with ACTUAL counts
-                results_data = []
-                for cls in range(1, 14):
-                    count = class_counts.get(cls, 0)  # Get actual count or 0
-                    results_data.append({
-                        'FHWA Class': cls,
-                        'Vehicle Type': fhwa_classes[cls],
-                        'Count': count,
-                        'Percentage': f"{(count/total*100):.1f}%" if total > 0 else "0%"
-                    })
-                
-                df = pd.DataFrame(results_data)
-                st.dataframe(df, use_container_width=True)
+            st.session_state.results_df = pd.DataFrame(results_data)
             
-            with col2:
-                st.subheader("📈 Distribution")
-                chart_data = df[df['Count'] > 0][['Vehicle Type', 'Count']]
-                if not chart_data.empty:
-                    st.bar_chart(chart_data.set_index('Vehicle Type'))
-            
-            # Download processed video
-            st.subheader("⬇️ Download Results")
-            with open(output_path, 'rb') as f:
-                st.download_button(
-                    label="📥 Download Processed Video",
-                    data=f,
-                    file_name=f"processed_{uploaded_file.name}",
-                    mime="video/mp4"
-                )
-            
-            # ✅ FIXED: Download CSV with ACTUAL counts
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_data = {'Time Slot': [datetime.now().strftime("%I:%M %P")]}
             
-            # Build CSV data with actual counts from class_counts dictionary
-            csv_data = {'Time Slot': [datetime.now().strftime("%I:%M %p")]}
-            
-            # Add each class count (1-13)
             for i in range(1, 14):
-                csv_data[f'Class {i}'] = [class_counts.get(i, 0)]  # Use actual count
+                csv_data[f'Class {i}'] = [class_counts.get(i, 0)]
             
-            csv_data['Total'] = [total]  # Add total
-            
+            csv_data['Total'] = [total]
             csv_df = pd.DataFrame(csv_data)
-            csv_string = csv_df.to_csv(index=False)
+            st.session_state.csv_data = csv_df.to_csv(index=False)
+            st.session_state.csv_filename = f"vehicle_counts_{timestamp}.csv"
+            st.session_state.video_filename = f"processed_{uploaded_file.name}"
             
-            # Show preview of CSV data
-            st.subheader("📄 CSV Preview")
-            st.dataframe(csv_df)
-            
-            st.download_button(
-                label="📥 Download CSV Report",
-                data=csv_string,
-                file_name=f"vehicle_counts_{timestamp}.csv",
-                mime="text/csv"
-            )
-            
-            # Debug info
-            st.info(f"🔍 Debug: class_counts dictionary = {dict(class_counts)}")
-            
-            # Cleanup
-            os.unlink(output_path)
+            st.success(f"✅ Processing Complete! Total vehicles counted: {total}")
+            st.rerun()
             
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
             st.exception(e)
     
-    # Cleanup temp file
-    os.unlink(video_path)
+    if not st.session_state.processed:
+        os.unlink(video_path)
 
-else:
+# Display results if processed (PERSISTENT)
+if st.session_state.processed:
+    st.subheader("⬇️ Download Results")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.session_state.output_video_path and os.path.exists(st.session_state.output_video_path):
+            with open(st.session_state.output_video_path, 'rb') as f:
+                st.download_button(
+                    label="📥 Download Processed Video",
+                    data=f,
+                    file_name=st.session_state.video_filename,
+                    mime="video/mp4",
+                    key="download_video"
+                )
+    
+    with col2:
+        if st.session_state.csv_data:
+            st.download_button(
+                label="📥 Download CSV Report",
+                data=st.session_state.csv_data,
+                file_name=st.session_state.csv_filename,
+                mime="text/csv",
+                key="download_csv"
+            )
+    
+    st.subheader("📊 Vehicle Count Summary")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.metric("Total Vehicles", st.session_state.total_count)
+        st.dataframe(st.session_state.results_df, use_container_width=True)
+    
+    with col2:
+        st.subheader("📈 Distribution")
+        chart_data = st.session_state.results_df[st.session_state.results_df['Count'] > 0][['Vehicle Type', 'Count']]
+        if not chart_data.empty:
+            st.bar_chart(chart_data.set_index('Vehicle Type'))
+    
+    st.subheader("📄 CSV Preview")
+    csv_preview_df = pd.read_csv(pd.io.common.StringIO(st.session_state.csv_data))
+    st.dataframe(csv_preview_df)
+    
+    st.info(f"🔍 Debug: class_counts dictionary = {st.session_state.class_counts}")
+    
+    if st.button("🔄 Process Another Video"):
+        if st.session_state.output_video_path and os.path.exists(st.session_state.output_video_path):
+            os.unlink(st.session_state.output_video_path)
+        
+        st.session_state.processed = False
+        st.session_state.output_video_path = None
+        st.session_state.csv_data = None
+        st.session_state.results_df = None
+        st.session_state.class_counts = None
+        st.session_state.total_count = 0
+        st.rerun()
+
+elif uploaded_file is None:
     st.info("👆 Please upload a video file to begin")
     st.markdown("""
     ### 📋 Instructions:
-    1. Upload a traffic video (MP4, AVI, MOV, MKV)
+    1. Upload a traffic video (MP4, AVI, MOV, MKV) - Max 10GB
     2. Adjust detection confidence and counting line position
     3. Click "Start Processing" to analyze
     4. Download results and CSV report
@@ -376,4 +389,5 @@ else:
     - ✅ **FHWA classification** - Automatic vehicle type detection
     - ✅ **Real-time progress** - See detection as it processes
     - ✅ **Export results** - Download video and CSV reports
+    - ✅ **Large file support** - Up to 10GB video files
     """)
