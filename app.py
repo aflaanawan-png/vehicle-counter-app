@@ -10,6 +10,7 @@ import os
 import time
 from multiprocessing import Process, Queue, Manager
 import subprocess
+import yt_dlp
 
 # Page configuration
 st.set_page_config(page_title="Vehicle Counter", layout="wide")
@@ -46,7 +47,6 @@ if 'video_duration' not in st.session_state:
 st.sidebar.header("⚙️ Configuration")
 confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.25, 0.05)
 skip_frames = st.sidebar.slider("Skip Frames (Speed)", 1, 10, 2)
-line_position = st.sidebar.slider("Counting Line Position", 0.0, 1.0, 0.5, 0.05)
 
 # Parallel processing option
 st.sidebar.header("🚀 Processing Mode")
@@ -96,25 +96,33 @@ def format_time(seconds):
         minutes = (seconds % 3600) / 60
         return f"{hours:.1f}h {minutes:.0f}m"
 
-# YOLO to FHWA mapping
-def map_to_fhwa(yolo_class, bbox_area):
-    """Map YOLO class to FHWA vehicle class"""
+# YOLO to FHWA mapping (IMPROVED for large vehicles)
+def map_to_fhwa(yolo_class, bbox_area, bbox_width, bbox_height):
+    """Map YOLO class to FHWA vehicle class with improved detection"""
+    aspect_ratio = bbox_width / bbox_height if bbox_height > 0 else 1
+    
     if yolo_class == 3:  # motorcycle
         return 1
     elif yolo_class == 2:  # car
-        return 2 if bbox_area < 5000 else 3
+        # Larger cars = pickup/van
+        if bbox_area > 6000 or aspect_ratio > 2.0:
+            return 3  # Pickup/Van
+        return 2  # Passenger Car
     elif yolo_class == 5:  # bus
         return 4
     elif yolo_class == 7:  # truck
-        if bbox_area < 8000:
-            return 5
-        elif bbox_area < 15000:
-            return 8
+        # Improved truck classification based on size
+        if bbox_area < 10000:
+            return 5  # Single Unit Truck (2-axle)
+        elif bbox_area < 18000:
+            return 8  # Single Trailer Truck (3-4 axle)
+        elif bbox_area < 28000:
+            return 9  # Single Trailer Truck (5-axle)
         else:
-            return 9
+            return 10  # Single Trailer Truck (6+ axle)
     return 2
 
-# Vehicle tracker
+# Vehicle tracker (NO COUNTING LINE - counts when first detected)
 class VehicleTracker:
     def __init__(self, max_disappeared=30, max_distance=100):
         self.next_object_id = 0
@@ -125,19 +133,21 @@ class VehicleTracker:
         self.max_distance = max_distance
         
     def register(self, centroid, fhwa_class):
+        """Register new vehicle and count it immediately"""
         self.objects[self.next_object_id] = {
             'centroid': centroid,
-            'class': fhwa_class,
-            'crossed': False
+            'class': fhwa_class
         }
         self.disappeared[self.next_object_id] = 0
         self.next_object_id += 1
+        return self.next_object_id - 1  # Return the ID of newly registered vehicle
         
     def deregister(self, object_id):
         del self.objects[object_id]
         del self.disappeared[object_id]
         
-    def update(self, detections, line_y):
+    def update(self, detections):
+        """Update tracker and return newly counted vehicles"""
         newly_counted = []
         
         if len(detections) == 0:
@@ -151,8 +161,12 @@ class VehicleTracker:
         input_classes = [d[1] for d in detections]
         
         if len(self.objects) == 0:
+            # First detections - register and count all
             for i, (centroid, fhwa_class) in enumerate(detections):
-                self.register(centroid, fhwa_class)
+                new_id = self.register(centroid, fhwa_class)
+                if new_id not in self.counted:
+                    self.counted.add(new_id)
+                    newly_counted.append(fhwa_class)
         else:
             object_ids = list(self.objects.keys())
             object_centroids = np.array([self.objects[oid]['centroid'] for oid in object_ids])
@@ -173,19 +187,8 @@ class VehicleTracker:
                     continue
                     
                 object_id = object_ids[row]
-                old_centroid = self.objects[object_id]['centroid']
-                new_centroid = input_centroids[col]
-                
-                self.objects[object_id]['centroid'] = new_centroid
+                self.objects[object_id]['centroid'] = input_centroids[col]
                 self.disappeared[object_id] = 0
-                
-                if (object_id not in self.counted and 
-                    not self.objects[object_id]['crossed'] and
-                    old_centroid[1] < line_y <= new_centroid[1]):
-                    
-                    self.objects[object_id]['crossed'] = True
-                    self.counted.add(object_id)
-                    newly_counted.append(self.objects[object_id]['class'])
                 
                 used_rows.add(row)
                 used_cols.add(col)
@@ -197,17 +200,41 @@ class VehicleTracker:
                 if self.disappeared[object_id] > self.max_disappeared:
                     self.deregister(object_id)
             
+            # New detections - register and count
             unused_cols = set(range(D.shape[1])) - used_cols
             for col in unused_cols:
-                self.register(input_centroids[col], input_classes[col])
+                new_id = self.register(input_centroids[col], input_classes[col])
+                if new_id not in self.counted:
+                    self.counted.add(new_id)
+                    newly_counted.append(input_classes[col])
         
         return newly_counted
+
+# Function to download YouTube video
+def download_youtube_video(url, progress_callback=None):
+    """Download YouTube video and return local path"""
+    try:
+        output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+        
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',
+            'outtmpl': output_path,
+            'quiet': True,
+            'no_warnings': True,
+            'progress_hooks': [progress_callback] if progress_callback else [],
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        return output_path, None
+    except Exception as e:
+        return None, str(e)
 
 # Function to split video into two parts using ffmpeg
 def split_video(input_path, output_path1, output_path2):
     """Split video into two equal parts using ffmpeg"""
     try:
-        # Get video duration
         cap = cv2.VideoCapture(input_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -216,8 +243,6 @@ def split_video(input_path, output_path1, output_path2):
         
         mid_point = duration / 2
         
-        # Split using ffmpeg (much faster than frame-by-frame)
-        # First half
         cmd1 = [
             'ffmpeg', '-i', input_path,
             '-t', str(mid_point),
@@ -225,7 +250,6 @@ def split_video(input_path, output_path1, output_path2):
             '-y', output_path1
         ]
         
-        # Second half
         cmd2 = [
             'ffmpeg', '-i', input_path,
             '-ss', str(mid_point),
@@ -242,7 +266,7 @@ def split_video(input_path, output_path1, output_path2):
         return False, 0
 
 # Process video segment (for parallel processing)
-def process_video_segment(video_path, confidence, skip_frames, line_position, 
+def process_video_segment(video_path, confidence, skip_frames, 
                          segment_id, result_queue, progress_dict):
     """Process a video segment and return results"""
     try:
@@ -254,13 +278,11 @@ def process_video_segment(video_path, confidence, skip_frames, line_position,
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        line_y = int(height * line_position)
         tracker = VehicleTracker(max_disappeared=fps, max_distance=150)
         class_counts = defaultdict(int)
         
         frame_count = 0
         
-        # Output video path
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps//skip_frames, (width, height))
@@ -286,7 +308,9 @@ def process_video_segment(video_path, confidence, skip_frames, line_position,
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                         centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
                         bbox_area = (x2 - x1) * (y2 - y1)
-                        fhwa_class = map_to_fhwa(cls, bbox_area)
+                        bbox_width = x2 - x1
+                        bbox_height = y2 - y1
+                        fhwa_class = map_to_fhwa(cls, bbox_area, bbox_width, bbox_height)
                         detections.append((centroid, fhwa_class))
                         
                         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
@@ -294,19 +318,18 @@ def process_video_segment(video_path, confidence, skip_frames, line_position,
                         cv2.putText(frame, f"Class {fhwa_class}", (int(x1), int(y1)-10),
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
-            newly_counted = tracker.update(detections, line_y)
+            newly_counted = tracker.update(detections)
             for fhwa_class in newly_counted:
                 class_counts[fhwa_class] += 1
             
-            cv2.line(frame, (0, line_y), (width, line_y), (0, 0, 255), 3)
-            cv2.putText(frame, f"SEGMENT {segment_id}", (10, line_y - 10),
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(frame, f"SEGMENT {segment_id}", (10, 30),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             
             total_count = sum(class_counts.values())
-            cv2.putText(frame, f"Total: {total_count}", (10, 30),
+            cv2.putText(frame, f"Total: {total_count}", (10, 65),
                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             
-            y_offset = 65
+            y_offset = 100
             for cls, count in sorted(class_counts.items()):
                 if count > 0:
                     cv2.putText(frame, f"C{cls}: {count}", (10, y_offset),
@@ -315,14 +338,12 @@ def process_video_segment(video_path, confidence, skip_frames, line_position,
             
             out.write(frame)
             
-            # Update progress
             progress = frame_count / total_frames
             progress_dict[f'segment_{segment_id}'] = progress
         
         cap.release()
         out.release()
         
-        # Return results
         result_queue.put({
             'segment_id': segment_id,
             'class_counts': dict(class_counts),
@@ -339,13 +360,11 @@ def process_video_segment(video_path, confidence, skip_frames, line_position,
 def merge_videos(video1_path, video2_path, output_path):
     """Merge two videos using ffmpeg"""
     try:
-        # Create concat file
         concat_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
         concat_file.write(f"file '{video1_path}'\n")
         concat_file.write(f"file '{video2_path}'\n")
         concat_file.close()
         
-        # Merge videos
         cmd = [
             'ffmpeg', '-f', 'concat', '-safe', '0',
             '-i', concat_file.name,
@@ -361,18 +380,56 @@ def merge_videos(video1_path, video2_path, output_path):
         st.error(f"Error merging videos: {e}")
         return False
 
-# File uploader with 10GB limit
-uploaded_file = st.file_uploader("📁 Upload Video File (Max 10GB)", 
-                                  type=['mp4', 'avi', 'mov', 'mkv'],
-                                  accept_multiple_files=False)
+# Video input options
+st.subheader("📹 Video Input")
+input_method = st.radio(
+    "Select Input Method",
+    options=["Upload Video File", "YouTube URL"],
+    horizontal=True
+)
 
-if uploaded_file is not None:
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-    tfile.write(uploaded_file.read())
-    video_path = tfile.name
+video_path = None
+
+if input_method == "Upload Video File":
+    uploaded_file = st.file_uploader("📁 Upload Video File (Max 10GB)", 
+                                      type=['mp4', 'avi', 'mov', 'mkv'],
+                                      accept_multiple_files=False)
     
-    st.video(video_path)
+    if uploaded_file is not None:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(uploaded_file.read())
+        video_path = tfile.name
+        st.video(video_path)
+
+else:  # YouTube URL
+    youtube_url = st.text_input("🔗 Enter YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
     
+    if youtube_url:
+        if st.button("📥 Download Video", type="secondary"):
+            with st.spinner("⬇️ Downloading video from YouTube..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                def progress_hook(d):
+                    if d['status'] == 'downloading':
+                        try:
+                            percent = d.get('downloaded_bytes', 0) / d.get('total_bytes', 1) * 100
+                            progress_bar.progress(min(percent / 100, 1.0))
+                            status_text.text(f"Downloading: {percent:.1f}%")
+                        except:
+                            pass
+                
+                video_path, error = download_youtube_video(youtube_url, progress_hook)
+                
+                if error:
+                    st.error(f"❌ Download failed: {error}")
+                    video_path = None
+                else:
+                    progress_bar.progress(1.0)
+                    st.success("✅ Download complete!")
+                    st.video(video_path)
+
+if video_path is not None:
     # Check video duration
     cap_temp = cv2.VideoCapture(video_path)
     total_frames_temp = int(cap_temp.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -382,10 +439,10 @@ if uploaded_file is not None:
     
     # Display info based on mode
     if enable_parallel:
-        estimated_time = video_duration_temp / (skip_frames * 2)  # Rough estimate with 2x speedup
+        estimated_time = video_duration_temp / (skip_frames * 2)
         st.info(f"🚀 **Parallel Mode** | Video: {format_time(video_duration_temp)} | Est. Processing: ~{format_time(estimated_time)} | Speedup: ~2x")
     else:
-        estimated_time = video_duration_temp / skip_frames  # Rough estimate
+        estimated_time = video_duration_temp / skip_frames
         st.info(f"📊 **Single Thread Mode** | Video: {format_time(video_duration_temp)} | Est. Processing: ~{format_time(estimated_time)}")
     
     if st.button("▶️ Start Processing", type="primary"):
@@ -397,7 +454,6 @@ if uploaded_file is not None:
             if enable_parallel:
                 st.info("🔄 Splitting video into 2 segments for parallel processing...")
                 
-                # Split video
                 segment1_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
                 segment2_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
                 
@@ -410,28 +466,24 @@ if uploaded_file is not None:
                 else:
                     st.success("✅ Video split complete! Starting parallel processing...")
                     
-                    # Create shared progress dictionary
                     manager = Manager()
                     progress_dict = manager.dict()
                     progress_dict['segment_1'] = 0.0
                     progress_dict['segment_2'] = 0.0
                     
-                    # Create result queue
                     result_queue = Queue()
                     
-                    # Start two processes
                     with st.spinner("🔄 Loading YOLO models for both segments..."):
                         p1 = Process(target=process_video_segment, 
-                                    args=(segment1_path, confidence, skip_frames, line_position, 
+                                    args=(segment1_path, confidence, skip_frames, 
                                           1, result_queue, progress_dict))
                         p2 = Process(target=process_video_segment, 
-                                    args=(segment2_path, confidence, skip_frames, line_position, 
+                                    args=(segment2_path, confidence, skip_frames, 
                                           2, result_queue, progress_dict))
                         
                         p1.start()
                         p2.start()
                     
-                    # Monitor progress
                     col1, col2 = st.columns(2)
                     with col1:
                         st.write("🎬 **Segment 1** (First Half)")
@@ -465,7 +517,6 @@ if uploaded_file is not None:
                     progress_bar1.progress(1.0)
                     progress_bar2.progress(1.0)
                     
-                    # Get results
                     results = []
                     while not result_queue.empty():
                         results.append(result_queue.get())
@@ -473,15 +524,12 @@ if uploaded_file is not None:
                     if len(results) != 2:
                         raise Exception("Failed to process both segments")
                     
-                    # Sort by segment_id
                     results.sort(key=lambda x: x['segment_id'])
                     
-                    # Check for errors
                     for result in results:
                         if 'error' in result:
                             raise Exception(f"Segment {result['segment_id']} error: {result['error']}")
                     
-                    # Merge class counts
                     class_counts = defaultdict(int)
                     for result in results:
                         for cls, count in result['class_counts'].items():
@@ -489,7 +537,6 @@ if uploaded_file is not None:
                     
                     st.info("🔄 Merging processed video segments...")
                     
-                    # Merge videos
                     output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
                     merge_success = merge_videos(results[0]['output_path'], 
                                                 results[1]['output_path'], 
@@ -499,7 +546,6 @@ if uploaded_file is not None:
                         st.warning("⚠️ Video merge failed, using first segment only")
                         output_path = results[0]['output_path']
                     
-                    # Cleanup
                     os.unlink(segment1_path)
                     os.unlink(segment2_path)
                     if merge_success:
@@ -524,7 +570,6 @@ if uploaded_file is not None:
                 
                 video_duration_seconds = total_frames / fps if fps > 0 else 0
                 
-                line_y = int(height * line_position)
                 tracker = VehicleTracker(max_disappeared=fps, max_distance=150)
                 class_counts = defaultdict(int)
                 
@@ -563,7 +608,9 @@ if uploaded_file is not None:
                                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                                 centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
                                 bbox_area = (x2 - x1) * (y2 - y1)
-                                fhwa_class = map_to_fhwa(cls, bbox_area)
+                                bbox_width = x2 - x1
+                                bbox_height = y2 - y1
+                                fhwa_class = map_to_fhwa(cls, bbox_area, bbox_width, bbox_height)
                                 detections.append((centroid, fhwa_class))
                                 
                                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
@@ -571,13 +618,9 @@ if uploaded_file is not None:
                                 cv2.putText(frame, f"Class {fhwa_class}", (int(x1), int(y1)-10),
                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                     
-                    newly_counted = tracker.update(detections, line_y)
+                    newly_counted = tracker.update(detections)
                     for fhwa_class in newly_counted:
                         class_counts[fhwa_class] += 1
-                    
-                    cv2.line(frame, (0, line_y), (width, line_y), (0, 0, 255), 3)
-                    cv2.putText(frame, "COUNTING LINE", (10, line_y - 10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     
                     y_offset = 30
                     total_count = sum(class_counts.values())
@@ -611,13 +654,11 @@ if uploaded_file is not None:
                 out.release()
                 video_duration_seconds = video_duration_temp
             
-            # End timing
             end_time = time.time()
             processing_time = end_time - start_time
             
             total = sum(class_counts.values())
             
-            # Store in session state
             st.session_state.processed = True
             st.session_state.output_video_path = output_path
             st.session_state.class_counts = dict(class_counts)
@@ -648,7 +689,11 @@ if uploaded_file is not None:
             csv_df = pd.DataFrame(csv_data)
             st.session_state.csv_data = csv_df.to_csv(index=False)
             st.session_state.csv_filename = f"vehicle_counts_{timestamp}.csv"
-            st.session_state.video_filename = f"processed_{uploaded_file.name}"
+            
+            if input_method == "Upload Video File":
+                st.session_state.video_filename = f"processed_{uploaded_file.name}"
+            else:
+                st.session_state.video_filename = f"processed_youtube_{timestamp}.mp4"
             
             st.success(f"✅ Processing Complete! Total vehicles counted: {total}")
             st.balloons()
@@ -658,7 +703,7 @@ if uploaded_file is not None:
             st.error(f"❌ Error: {str(e)}")
             st.exception(e)
     
-    if not st.session_state.processed:
+    if not st.session_state.processed and input_method == "Upload Video File":
         os.unlink(video_path)
 
 # Display results if processed (PERSISTENT)
@@ -737,43 +782,40 @@ if st.session_state.processed:
         st.session_state.parallel_used = False
         st.rerun()
 
-elif uploaded_file is None:
-    st.info("👆 Please upload a video file to begin")
+elif video_path is None:
+    st.info("👆 Please select a video input method to begin")
     st.markdown("""
     ### 📋 Instructions:
-    1. Upload a traffic video (MP4, AVI, MOV, MKV) - Max 10GB
+    1. **Choose input method**:
+       - **Upload Video File**: MP4, AVI, MOV, MKV (Max 10GB)
+       - **YouTube URL**: Paste any YouTube video URL
     2. **Select Processing Mode** in sidebar:
        - **Single Thread**: Standard processing
        - **Parallel (2x Speed)**: Split video and process simultaneously
-    3. Adjust detection confidence and counting line position
+    3. Adjust detection confidence and skip frames
     4. Click "Start Processing" to analyze
     5. Download results and CSV report
     
+    ### 🎯 **New Features:**
+    - ✅ **No counting line needed** - Vehicles counted when first detected
+    - ✅ **YouTube support** - Download and process YouTube videos directly
+    - ✅ **Improved large vehicle detection** - Better truck/bus classification
+    - ✅ **Aspect ratio analysis** - More accurate vehicle type identification
+    
     ### 🚀 **Parallel Processing Mode:**
-    - ✅ **Works with ANY video length** - You choose the mode!
     - ✅ **~2x faster** - Processes two halves simultaneously
+    - ✅ **Works with ANY video length**
     - ✅ **Single output** - Merged video + combined CSV
     - ✅ **Real-time progress** - See both segments processing
-    - ✅ **Automatic fallback** - Falls back to single thread if splitting fails
     
-    ### 📊 **Performance Comparison:**
+    ### 📊 **Detection Improvements:**
+    - 🚗 Better car vs pickup/van distinction
+    - 🚛 Improved truck size classification
+    - 🚌 Enhanced bus detection
+    - 📏 Aspect ratio-based classification
     
-    | Video Length | Single Thread | Parallel Mode | Time Saved |
-    |--------------|---------------|---------------|------------|
-    | 1 hour | 30 min | 15 min | 15 min |
-    | 2 hours | 1 hour | 30 min | 30 min |
-    | 4 hours | 2 hours | 1 hour | 1 hour |
-    | 8 hours | 4 hours | 2 hours | **2 hours** 🚀 |
-    
-    ### 🎯 **Features:**
-    - ✅ No double counting
-    - ✅ FHWA 13-class classification
-    - ✅ Real-time progress tracking
-    - ✅ CSV export with combined counts
-    - ✅ Merged video output
-    - ✅ User-selectable processing mode
-    
-    ### ⚙️ **Requirements for Parallel Mode:**
-    - `ffmpeg` must be installed on your system
+    ### ⚙️ **Requirements:**
+    - `ffmpeg` for parallel mode
+    - `yt-dlp` for YouTube downloads
     - Multi-core CPU recommended for best performance
     """)
