@@ -190,7 +190,7 @@ if uploaded_file is not None:
             
             # Initialize tracker and counters
             tracker = VehicleTracker(max_disappeared=fps, max_distance=150)
-            class_counts = defaultdict(int)
+            class_counts = defaultdict(int)  # THIS WILL STORE THE COUNTS
             
             # Progress tracking
             progress_bar = st.progress(0)
@@ -241,21 +241,28 @@ if uploaded_file is not None:
                             cv2.putText(frame, f"Class {fhwa_class}", (int(x1), int(y1)-10),
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
-                # Update tracker
+                # Update tracker and COUNT VEHICLES
                 newly_counted = tracker.update(detections, line_y)
                 for fhwa_class in newly_counted:
-                    class_counts[fhwa_class] += 1
+                    class_counts[fhwa_class] += 1  # INCREMENT THE COUNT HERE
                 
                 # Draw counting line
                 cv2.line(frame, (0, line_y), (width, line_y), (0, 0, 255), 3)
                 cv2.putText(frame, "COUNTING LINE", (10, line_y - 10),
                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 
-                # Draw counts
+                # Draw counts on frame
                 y_offset = 30
                 total_count = sum(class_counts.values())
                 cv2.putText(frame, f"Total: {total_count}", (10, y_offset),
                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                
+                # Show individual class counts on frame
+                for cls, count in sorted(class_counts.items()):
+                    if count > 0:
+                        y_offset += 35
+                        cv2.putText(frame, f"Class {cls}: {count}", (10, y_offset),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
                 # Write frame
                 out.write(frame)
@@ -273,21 +280,23 @@ if uploaded_file is not None:
             cap.release()
             out.release()
             
+            # ✅ FIXED: Calculate total AFTER processing loop
+            total = sum(class_counts.values())
+            
             # Show final results
-            st.success("✅ Processing Complete!")
+            st.success(f"✅ Processing Complete! Total vehicles counted: {total}")
             
             # Display results
             col1, col2 = st.columns(2)
             
             with col1:
                 st.subheader("📊 Vehicle Count Summary")
-                total = sum(class_counts.values())
                 st.metric("Total Vehicles", total)
                 
-                # Create DataFrame
+                # Create DataFrame with ACTUAL counts
                 results_data = []
                 for cls in range(1, 14):
-                    count = class_counts.get(cls, 0)
+                    count = class_counts.get(cls, 0)  # Get actual count or 0
                     results_data.append({
                         'FHWA Class': cls,
                         'Vehicle Type': fhwa_classes[cls],
@@ -314,15 +323,24 @@ if uploaded_file is not None:
                     mime="video/mp4"
                 )
             
-            # Download CSV
+            # ✅ FIXED: Download CSV with ACTUAL counts
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            csv_data = {
-                'Time Slot': [datetime.now().strftime("%I:%M %p")],
-                **{f'Class {i}': [class_counts.get(i, 0)] for i in range(1, 14)},
-                'Total': [total]
-            }
+            
+            # Build CSV data with actual counts from class_counts dictionary
+            csv_data = {'Time Slot': [datetime.now().strftime("%I:%M %p")]}
+            
+            # Add each class count (1-13)
+            for i in range(1, 14):
+                csv_data[f'Class {i}'] = [class_counts.get(i, 0)]  # Use actual count
+            
+            csv_data['Total'] = [total]  # Add total
+            
             csv_df = pd.DataFrame(csv_data)
             csv_string = csv_df.to_csv(index=False)
+            
+            # Show preview of CSV data
+            st.subheader("📄 CSV Preview")
+            st.dataframe(csv_df)
             
             st.download_button(
                 label="📥 Download CSV Report",
@@ -330,6 +348,9 @@ if uploaded_file is not None:
                 file_name=f"vehicle_counts_{timestamp}.csv",
                 mime="text/csv"
             )
+            
+            # Debug info
+            st.info(f"🔍 Debug: class_counts dictionary = {dict(class_counts)}")
             
             # Cleanup
             os.unlink(output_path)
