@@ -497,7 +497,7 @@ if st.session_state.processed:
         if st.session_state.csv_data:
             st.download_button(
                 label="📥 Download CSV Report",
-                data=st.session_data,
+                data=st.session_state.csv_data,
                 file_name=st.session_state.csv_filename,
                 mime="text/csv",
                 key="download_csv"
