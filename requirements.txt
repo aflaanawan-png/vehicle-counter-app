@@ -5,4 +5,5 @@ numpy>=1.26.0
 pandas>=2.0.0
 Pillow>=10.0.0
 torch>=2.0.0
+lap>=0.4.0
 torchvision>=0.15.0
