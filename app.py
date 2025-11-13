@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 import tempfile
 import os
+import time
 
 # Page configuration
 st.set_page_config(page_title="Vehicle Counter", layout="wide")
@@ -34,9 +35,13 @@ if 'class_counts' not in st.session_state:
     st.session_state.class_counts = None
 if 'total_count' not in st.session_state:
     st.session_state.total_count = 0
+if 'processing_time' not in st.session_state:
+    st.session_state.processing_time = 0
+if 'video_duration' not in st.session_state:
+    st.session_state.video_duration = 0
 
 # Sidebar configuration
-st.sidebar.header("⚙ Configuration")
+st.sidebar.header("⚙️ Configuration")
 confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.25, 0.05)
 skip_frames = st.sidebar.slider("Skip Frames (Speed)", 1, 10, 2)
 line_position = st.sidebar.slider("Counting Line Position", 0.0, 1.0, 0.5, 0.05)
@@ -62,6 +67,14 @@ fhwa_classes = {
 for cls, name in fhwa_classes.items():
     st.sidebar.text(f"Class {cls}: {name}")
 
+# Helper function to format time
+def format_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f} seconds"
+    else:
+        minutes = seconds / 60
+        return f"{minutes:.1f} minutes ({seconds:.1f} seconds)"
+
 # YOLO to FHWA mapping
 def map_to_fhwa(yolo_class, bbox_area):
     """Map YOLO class to FHWA vehicle class"""
@@ -85,7 +98,7 @@ def map_to_fhwa(yolo_class, bbox_area):
 
 # Vehicle tracker
 class VehicleTracker:
-    def _init_(self, max_disappeared=30, max_distance=100):
+    def __init__(self, max_disappeared=30, max_distance=100):
         self.next_object_id = 0
         self.objects = {}
         self.disappeared = {}
@@ -184,9 +197,12 @@ if uploaded_file is not None:
     
     st.video(video_path)
     
-    if st.button("▶ Start Processing", type="primary"):
+    if st.button("▶️ Start Processing", type="primary"):
         try:
             st.session_state.processed = False
+            
+            # Start timing
+            start_time = time.time()
             
             with st.spinner("🔄 Loading YOLOv8 model..."):
                 model = YOLO('yolov8n.pt')
@@ -197,12 +213,16 @@ if uploaded_file is not None:
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
+            # Calculate estimated video duration
+            video_duration_seconds = total_frames / fps if fps > 0 else 0
+            
             line_y = int(height * line_position)
             tracker = VehicleTracker(max_disappeared=fps, max_distance=150)
             class_counts = defaultdict(int)
             
             progress_bar = st.progress(0)
             status_text = st.empty()
+            time_text = st.empty()
             frame_placeholder = st.empty()
             
             frame_count = 0
@@ -266,6 +286,14 @@ if uploaded_file is not None:
                 
                 progress = frame_count / total_frames
                 progress_bar.progress(progress)
+                
+                # Calculate elapsed and estimated time
+                elapsed_time = time.time() - start_time
+                if progress > 0:
+                    estimated_total = elapsed_time / progress
+                    remaining_time = estimated_total - elapsed_time
+                    time_text.text(f"⏱️ Elapsed: {format_time(elapsed_time)} | Estimated remaining: {format_time(remaining_time)}")
+                
                 status_text.text(f"Processing: {frame_count}/{total_frames} frames | Detected: {total_count} vehicles")
                 
                 if processed_frames % 30 == 0:
@@ -275,6 +303,10 @@ if uploaded_file is not None:
             cap.release()
             out.release()
             
+            # End timing
+            end_time = time.time()
+            processing_time = end_time - start_time
+            
             total = sum(class_counts.values())
             
             # Store in session state
@@ -282,6 +314,8 @@ if uploaded_file is not None:
             st.session_state.output_video_path = output_path
             st.session_state.class_counts = dict(class_counts)
             st.session_state.total_count = total
+            st.session_state.processing_time = processing_time
+            st.session_state.video_duration = video_duration_seconds
             
             results_data = []
             for cls in range(1, 14):
@@ -319,7 +353,23 @@ if uploaded_file is not None:
 
 # Display results if processed (PERSISTENT)
 if st.session_state.processed:
-    st.subheader("⬇ Download Results")
+    # Display processing time prominently
+    processing_speed = (st.session_state.video_duration / st.session_state.processing_time) if st.session_state.processing_time > 0 else 0
+    
+    st.markdown(f"""
+        <div style='background-color: #e8f4f8; padding: 15px; border-radius: 10px; margin: 20px 0; border-left: 5px solid #0066cc;'>
+            <h3 style='color: #0066cc; margin: 0;'>⏱️ Processing Time</h3>
+            <p style='font-size: 1.3rem; font-weight: bold; color: #004080; margin: 10px 0 5px 0;'>
+                {format_time(st.session_state.processing_time)}
+            </p>
+            <p style='color: #666; margin: 0; font-size: 0.9rem;'>
+                Video Duration: {format_time(st.session_state.video_duration)} | 
+                Processing Speed: {processing_speed:.1f}x faster than real-time
+            </p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    st.subheader("⬇️ Download Results")
     
     col1, col2 = st.columns(2)
     
@@ -373,6 +423,8 @@ if st.session_state.processed:
         st.session_state.results_df = None
         st.session_state.class_counts = None
         st.session_state.total_count = 0
+        st.session_state.processing_time = 0
+        st.session_state.video_duration = 0
         st.rerun()
 
 elif uploaded_file is None:
@@ -385,9 +437,10 @@ elif uploaded_file is None:
     4. Download results and CSV report
     
     ### 🎯 Features:
-    - ✅ *No double counting* - Advanced tracking prevents re-counting
-    - ✅ *FHWA classification* - Automatic vehicle type detection
-    - ✅ *Real-time progress* - See detection as it processes
-    - ✅ *Export results* - Download video and CSV reports
-    - ✅ *Large file support* - Up to 10GB video files
+    - ✅ **No double counting** - Advanced tracking prevents re-counting
+    - ✅ **FHWA classification** - Automatic vehicle type detection
+    - ✅ **Real-time progress** - See detection as it processes
+    - ✅ **Export results** - Download video and CSV reports
+    - ✅ **Large file support** - Up to 10GB video files
+    - ✅ **Processing time tracking** - See how fast your video is processed
     """)
